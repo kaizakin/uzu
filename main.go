@@ -25,8 +25,7 @@ const (
 
 var copyBufferPool = sync.Pool{
 	New: func() any {
-		buf := make([]byte, copyBufferSize)
-		return &buf
+		return new(make([]byte, copyBufferSize))
 	},
 }
 
