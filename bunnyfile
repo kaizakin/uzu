@@ -1,0 +1,28 @@
+#syntax=harbor.nbfc.io/nubificus/bunny:latest
+version: v0.1
+
+platforms:
+  framework: unikraft
+  version: v0.21.0
+  monitor: qemu
+  architecture: x86
+
+rootfs:
+  from: scratch
+  type: initrd
+  include:
+    - build/proxy:/proxy
+
+kernel:
+  from: local
+  path: build/elfloader_qemu-x86_64
+
+cmdline: >-
+  netdev.ip=172.44.0.2/24:172.44.0.1:172.44.0.1::tcp-proxy:local
+  --
+  /proxy
+  -listen=:8080
+  -backends=172.44.0.10:9001,172.44.0.11:9001,172.44.0.12:9001
+  -dial-timeout=3s
+  -shutdown-grace=10s
+  -tcp-keepalive=30s
