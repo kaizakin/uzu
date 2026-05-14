@@ -30,11 +30,15 @@ var copyBufferPool = sync.Pool{
 	},
 }
 
+// backendPool manages a list of backend server addresses to proxy traffic to.
+// It keeps track of available backends and uses an atomic counter for round-robin selection.
 type backendPool struct {
 	backends []string
 	next     atomic.Uint64
 }
 
+// newBackendPool parses a comma-separated string of backend addresses and initializes a backendPool.
+// We use this to construct the pool of available servers that the proxy will forward connections to.
 func newBackendPool(raw string) (*backendPool, error) {
 	parts := strings.Split(raw, ",")
 	backends := make([]string, 0, len(parts))
@@ -51,18 +55,26 @@ func newBackendPool(raw string) (*backendPool, error) {
 	return &backendPool{backends: backends}, nil
 }
 
+// size returns the number of backend servers in the pool.
+// It is used to iterate over all possible backends when attempting to dial them.
 func (p *backendPool) size() int {
 	return len(p.backends)
 }
 
+// nextStartIndex atomically increments the internal counter and returns the next starting index.
+// This is used to ensure a round-robin load balancing strategy across different connection attempts.
 func (p *backendPool) nextStartIndex() int {
 	return int(p.next.Add(1)-1) % len(p.backends)
 }
 
+// backendAt safely retrieves the backend address at a specific index using modulo arithmetic.
+// We use this to wrap around the slice when trying multiple backends sequentially.
 func (p *backendPool) backendAt(idx int) string {
 	return p.backends[idx%len(p.backends)]
 }
 
+// proxy represents the main proxy server instance.
+// It holds configuration, the backend pool, active connections state, and manages the listener lifecycle.
 type proxy struct {
 	listenAddr       string
 	dialTimeout      time.Duration
@@ -78,6 +90,8 @@ type proxy struct {
 	disableKeepAlive bool
 }
 
+// newProxy initializes and returns a new proxy server instance.
+// It sets up the configuration options and initializes the active connection tracking map.
 func newProxy(
 	listenAddr string,
 	dialTimeout time.Duration,
@@ -99,6 +113,8 @@ func newProxy(
 	}
 }
 
+// run starts the proxy server, listening for incoming TCP connections.
+// It handles context cancellation for graceful shutdowns and accepts connections in a continuous loop.
 func (p *proxy) run(ctx context.Context) error {
 	lc := net.ListenConfig{}
 	ln, err := lc.Listen(ctx, "tcp", p.listenAddr)
@@ -136,6 +152,8 @@ func (p *proxy) run(ctx context.Context) error {
 	}
 }
 
+// handleClient is responsible for processing an individual incoming client connection.
+// It tunes the TCP connection, dials a backend server, and sets up bi-directional traffic copying.
 func (p *proxy) handleClient(ctx context.Context, clientConn net.Conn) {
 	clientRemote := clientConn.RemoteAddr().String()
 	if err := tuneTCPConn(clientConn, p.tcpKeepAlive, p.disableKeepAlive); err != nil {
@@ -182,6 +200,8 @@ func (p *proxy) handleClient(ctx context.Context, clientConn net.Conn) {
 	}
 }
 
+// dialBackend attempts to establish a connection with one of the available backend servers.
+// It iterates through the backend pool starting from a round-robin index, providing fault tolerance if a backend is down.
 func (p *proxy) dialBackend(parent context.Context) (net.Conn, string, error) {
 	dialer := net.Dialer{Timeout: p.dialTimeout}
 	var lastErr error
@@ -202,6 +222,8 @@ func (p *proxy) dialBackend(parent context.Context) (net.Conn, string, error) {
 	return nil, "", lastErr
 }
 
+// initiateShutdown performs a graceful shutdown of the proxy server.
+// It closes the main listener, waits for active connections to finish within a grace period, and forcefully closes any remaining ones.
 func (p *proxy) initiateShutdown() {
 	p.shutdownOnce.Do(func() {
 		if p.listener != nil {
@@ -233,18 +255,24 @@ func (p *proxy) initiateShutdown() {
 	})
 }
 
+// trackConn adds a network connection to the proxy's active connections map.
+// This allows the proxy to keep track of active connections so they can be closed during shutdown.
 func (p *proxy) trackConn(conn net.Conn) {
 	p.activeConnMu.Lock()
 	p.activeConns[conn] = struct{}{}
 	p.activeConnMu.Unlock()
 }
 
+// untrackConn removes a network connection from the active connections map.
+// This is called when a connection has finished processing and no longer needs to be managed for shutdown.
 func (p *proxy) untrackConn(conn net.Conn) {
 	p.activeConnMu.Lock()
 	delete(p.activeConns, conn)
 	p.activeConnMu.Unlock()
 }
 
+// halfClose explicitly closes the read and write sides of the client and backend TCP connections.
+// This helps to cleanly terminate the connections and unblock any pending I/O operations.
 func (p *proxy) halfClose(clientConn net.Conn, backendConn net.Conn) {
 	if tcp, ok := clientConn.(*net.TCPConn); ok {
 		_ = tcp.CloseRead()
@@ -256,6 +284,8 @@ func (p *proxy) halfClose(clientConn net.Conn, backendConn net.Conn) {
 	}
 }
 
+// proxyCopy copies data from the source io.Reader to the destination io.Writer using a shared buffer pool.
+// It filters out expected network errors (like EOF or closed connections) to prevent unnecessary error logging.
 func proxyCopy(dst io.Writer, src io.Reader) error {
 	bufp := copyBufferPool.Get().(*[]byte)
 	defer copyBufferPool.Put(bufp)
@@ -274,6 +304,8 @@ func proxyCopy(dst io.Writer, src io.Reader) error {
 	return err
 }
 
+// firstRelevantCopyErr iterates through a list of errors and returns the first non-nil error.
+// It is used to capture and report the primary reason a connection failed during bi-directional copying.
 func firstRelevantCopyErr(errs ...error) error {
 	for _, err := range errs {
 		if err != nil {
@@ -283,6 +315,8 @@ func firstRelevantCopyErr(errs ...error) error {
 	return nil
 }
 
+// tuneTCPConn applies specific TCP socket options like NoDelay (Nagle's algorithm) and KeepAlive settings.
+// We use this to optimize the network connections for latency and to detect dead connections over time.
 func tuneTCPConn(conn net.Conn, keepAlive time.Duration, disableKeepAlive bool) error {
 	tcp, ok := conn.(*net.TCPConn)
 	if !ok {
@@ -300,6 +334,8 @@ func tuneTCPConn(conn net.Conn, keepAlive time.Duration, disableKeepAlive bool) 
 	return tcp.SetKeepAlivePeriod(keepAlive)
 }
 
+// main is the entry point of the unikernel-proxy application.
+// It parses command-line flags, initializes the backend pool and proxy instance, and handles OS signals for graceful termination.
 func main() {
 	var (
 		listenAddr       = flag.String("listen", defaultListenAddr, "listen address")
