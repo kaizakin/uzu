@@ -2,372 +2,335 @@ package main
 
 import (
 	"context"
+	"database/sql"
+	"encoding/json"
 	"errors"
 	"flag"
+	"fmt"
 	"io"
 	"log"
-	"net"
+	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
+
+	_ "modernc.org/sqlite"
 )
 
-const (
-	defaultListenAddr    = ":8080"
-	defaultDialTimeout   = 3 * time.Second
-	defaultShutdownGrace = 10 * time.Second
-	copyBufferSize       = 32 * 1024
-)
-
-var copyBufferPool = sync.Pool{
-	New: func() any {
-		buf := make([]byte, copyBufferSize)
-		return &buf
-	},
+type item struct {
+	Key       string    `json:"key"`
+	Value     string    `json:"value"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
-// backendPool manages a list of backend server addresses to proxy traffic to.
-// It keeps track of available backends and uses an atomic counter for round-robin selection.
-type backendPool struct {
-	backends []string
-	next     atomic.Uint64
+type itemInput struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
 }
 
-// newBackendPool parses a comma-separated string of backend addresses and initializes a backendPool.
-// We use this to construct the pool of available servers that the proxy will forward connections to.
-func newBackendPool(raw string) (*backendPool, error) {
-	parts := strings.Split(raw, ",")
-	backends := make([]string, 0, len(parts))
-	for _, part := range parts {
-		addr := strings.TrimSpace(part)
-		if addr == "" {
-			continue
-		}
-		backends = append(backends, addr)
+type apiError struct {
+	Error string `json:"error"`
+}
+
+type server struct {
+	db     *sql.DB
+	logger *log.Logger
+}
+
+func main() {
+	listen := flag.String("listen", envOrDefault("LISTEN_ADDR", ":8080"), "HTTP listen address")
+	dbPath := flag.String("db", envOrDefault("DB_PATH", "/data/app.db"), "SQLite database path")
+	flag.Parse()
+
+	if port := os.Getenv("PORT"); port != "" && *listen == ":8080" {
+		*listen = ":" + port
 	}
-	if len(backends) == 0 {
-		return nil, errors.New("at least one backend is required")
-	}
-	return &backendPool{backends: backends}, nil
-}
 
-// size returns the number of backend servers in the pool.
-// It is used to iterate over all possible backends when attempting to dial them.
-func (p *backendPool) size() int {
-	return len(p.backends)
-}
+	logger := log.New(os.Stdout, "sqlite-api ", log.Ldate|log.Ltime|log.Lmicroseconds|log.LUTC)
 
-// nextStartIndex atomically increments the internal counter and returns the next starting index.
-// This is used to ensure a round-robin load balancing strategy across different connection attempts.
-func (p *backendPool) nextStartIndex() int {
-	return int(p.next.Add(1)-1) % len(p.backends)
-}
-
-// backendAt safely retrieves the backend address at a specific index using modulo arithmetic.
-// We use this to wrap around the slice when trying multiple backends sequentially.
-func (p *backendPool) backendAt(idx int) string {
-	return p.backends[idx%len(p.backends)]
-}
-
-// proxy represents the main proxy server instance.
-// It holds configuration, the backend pool, active connections state, and manages the listener lifecycle.
-type proxy struct {
-	listenAddr       string
-	dialTimeout      time.Duration
-	shutdownGrace    time.Duration
-	tcpKeepAlive     time.Duration
-	backendPool      *backendPool
-	activeConnMu     sync.Mutex
-	activeConns      map[net.Conn]struct{}
-	listener         net.Listener
-	wg               sync.WaitGroup
-	shutdownOnce     sync.Once
-	logger           *log.Logger
-	disableKeepAlive bool
-}
-
-// newProxy initializes and returns a new proxy server instance.
-// It sets up the configuration options and initializes the active connection tracking map.
-func newProxy(
-	listenAddr string,
-	dialTimeout time.Duration,
-	shutdownGrace time.Duration,
-	tcpKeepAlive time.Duration,
-	disableKeepAlive bool,
-	pool *backendPool,
-	logger *log.Logger,
-) *proxy {
-	return &proxy{
-		listenAddr:       listenAddr,
-		dialTimeout:      dialTimeout,
-		shutdownGrace:    shutdownGrace,
-		tcpKeepAlive:     tcpKeepAlive,
-		backendPool:      pool,
-		activeConns:      make(map[net.Conn]struct{}),
-		logger:           logger,
-		disableKeepAlive: disableKeepAlive,
-	}
-}
-
-// run starts the proxy server, listening for incoming TCP connections.
-// It handles context cancellation for graceful shutdowns and accepts connections in a continuous loop.
-func (p *proxy) run(ctx context.Context) error {
-	lc := net.ListenConfig{}
-	ln, err := lc.Listen(ctx, "tcp", p.listenAddr)
+	db, err := openDatabase(*dbPath)
 	if err != nil {
-		return err
+		logger.Fatalf("open database: %v", err)
 	}
-	p.listener = ln
-	p.logger.Printf("proxy listening on %s with %d backends", p.listenAddr, p.backendPool.size())
+	defer db.Close()
+
+	if err := migrate(db); err != nil {
+		logger.Fatalf("migrate database: %v", err)
+	}
+
+	app := &server{db: db, logger: logger}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", app.healthz)
+	mux.HandleFunc("GET /items", app.listItems)
+	mux.HandleFunc("POST /items", app.createItem)
+	mux.HandleFunc("GET /items/", app.getItem)
+	mux.HandleFunc("PUT /items/", app.putItem)
+	mux.HandleFunc("DELETE /items/", app.deleteItem)
+
+	httpServer := &http.Server{
+		Addr:              *listen,
+		Handler:           requestLogger(logger, mux),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
 	go func() {
-		<-ctx.Done()
-		p.initiateShutdown()
+		logger.Printf("listening on %s, sqlite=%s", *listen, *dbPath)
+		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Fatalf("http server: %v", err)
+		}
 	}()
 
-	for {
-		clientConn, err := ln.Accept()
-		if err != nil {
-			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
-				return nil
-			}
-			var ne net.Error
-			if errors.As(err, &ne) && ne.Temporary() {
-				p.logger.Printf("temporary accept error: %v", err)
-				time.Sleep(50 * time.Millisecond)
-				continue
-			}
-			return err
-		}
+	<-ctx.Done()
+	logger.Println("shutdown requested")
 
-		p.wg.Add(1)
-		go func() {
-			defer p.wg.Done()
-			p.handleClient(ctx, clientConn)
-		}()
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := httpServer.Shutdown(shutdownCtx); err != nil {
+		logger.Fatalf("shutdown: %v", err)
 	}
+	logger.Println("shutdown complete")
 }
 
-// handleClient is responsible for processing an individual incoming client connection.
-// It tunes the TCP connection, dials a backend server, and sets up bi-directional traffic copying.
-func (p *proxy) handleClient(ctx context.Context, clientConn net.Conn) {
-	clientRemote := clientConn.RemoteAddr().String()
-	if err := tuneTCPConn(clientConn, p.tcpKeepAlive, p.disableKeepAlive); err != nil {
-		p.logger.Printf("client tune failed for %s: %v", clientRemote, err)
+func envOrDefault(name, fallback string) string {
+	if value := os.Getenv(name); value != "" {
+		return value
+	}
+	return fallback
+}
+
+func openDatabase(path string) (*sql.DB, error) {
+	if path == "" {
+		return nil, errors.New("database path is required")
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, fmt.Errorf("create database directory: %w", err)
 	}
 
-	backendConn, backendAddr, err := p.dialBackend(ctx)
+	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(DELETE)&_pragma=foreign_keys(ON)", path)
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
-		p.logger.Printf("backend dial failed for %s: %v", clientRemote, err)
-		_ = clientConn.Close()
-		return
+		return nil, err
 	}
-	defer backendConn.Close()
-	defer clientConn.Close()
+	db.SetMaxOpenConns(1)
 
-	if err := tuneTCPConn(backendConn, p.tcpKeepAlive, p.disableKeepAlive); err != nil {
-		p.logger.Printf("backend tune failed for %s -> %s: %v", clientRemote, backendAddr, err)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := db.PingContext(ctx); err != nil {
+		db.Close()
+		return nil, err
 	}
-
-	p.trackConn(clientConn)
-	p.trackConn(backendConn)
-	defer p.untrackConn(clientConn)
-	defer p.untrackConn(backendConn)
-
-	p.logger.Printf("accepted %s -> %s", clientRemote, backendAddr)
-
-	errCh := make(chan error, 2)
-
-	go func() {
-		errCh <- proxyCopy(backendConn, clientConn)
-	}()
-	go func() {
-		errCh <- proxyCopy(clientConn, backendConn)
-	}()
-
-	firstErr := <-errCh
-	p.halfClose(clientConn, backendConn)
-	secondErr := <-errCh
-
-	if err := firstRelevantCopyErr(firstErr, secondErr); err != nil {
-		p.logger.Printf("connection %s -> %s closed with error: %v", clientRemote, backendAddr, err)
-	} else {
-		p.logger.Printf("connection %s -> %s closed cleanly", clientRemote, backendAddr)
-	}
+	return db, nil
 }
 
-// dialBackend attempts to establish a connection with one of the available backend servers.
-// It iterates through the backend pool starting from a round-robin index, providing fault tolerance if a backend is down.
-func (p *proxy) dialBackend(parent context.Context) (net.Conn, string, error) {
-	dialer := net.Dialer{Timeout: p.dialTimeout}
-	var lastErr error
-	start := p.backendPool.nextStartIndex()
-
-	for attempt := 0; attempt < p.backendPool.size(); attempt++ {
-		backendAddr := p.backendPool.backendAt(start + attempt)
-		ctx, cancel := context.WithTimeout(parent, p.dialTimeout)
-		conn, err := dialer.DialContext(ctx, "tcp", backendAddr)
-		cancel()
-		if err == nil {
-			return conn, backendAddr, nil
-		}
-		lastErr = err
-		p.logger.Printf("dial attempt %d to %s failed: %v", attempt+1, backendAddr, err)
-	}
-
-	return nil, "", lastErr
-}
-
-// initiateShutdown performs a graceful shutdown of the proxy server.
-// It closes the main listener, waits for active connections to finish within a grace period, and forcefully closes any remaining ones.
-func (p *proxy) initiateShutdown() {
-	p.shutdownOnce.Do(func() {
-		if p.listener != nil {
-			_ = p.listener.Close()
-		}
-
-		done := make(chan struct{})
-		go func() {
-			p.wg.Wait()
-			close(done)
-		}()
-
-		timer := time.NewTimer(p.shutdownGrace)
-		defer timer.Stop()
-
-		select {
-		case <-done:
-			return
-		case <-timer.C:
-		}
-
-		p.activeConnMu.Lock()
-		for conn := range p.activeConns {
-			_ = conn.Close()
-		}
-		p.activeConnMu.Unlock()
-
-		<-done
-	})
-}
-
-// trackConn adds a network connection to the proxy's active connections map.
-// This allows the proxy to keep track of active connections so they can be closed during shutdown.
-func (p *proxy) trackConn(conn net.Conn) {
-	p.activeConnMu.Lock()
-	p.activeConns[conn] = struct{}{}
-	p.activeConnMu.Unlock()
-}
-
-// untrackConn removes a network connection from the active connections map.
-// This is called when a connection has finished processing and no longer needs to be managed for shutdown.
-func (p *proxy) untrackConn(conn net.Conn) {
-	p.activeConnMu.Lock()
-	delete(p.activeConns, conn)
-	p.activeConnMu.Unlock()
-}
-
-// halfClose explicitly closes the read and write sides of the client and backend TCP connections.
-// This helps to cleanly terminate the connections and unblock any pending I/O operations.
-func (p *proxy) halfClose(clientConn net.Conn, backendConn net.Conn) {
-	if tcp, ok := clientConn.(*net.TCPConn); ok {
-		_ = tcp.CloseRead()
-		_ = tcp.CloseWrite()
-	}
-	if tcp, ok := backendConn.(*net.TCPConn); ok {
-		_ = tcp.CloseRead()
-		_ = tcp.CloseWrite()
-	}
-}
-
-// proxyCopy copies data from the source io.Reader to the destination io.Writer using a shared buffer pool.
-// It filters out expected network errors (like EOF or closed connections) to prevent unnecessary error logging.
-func proxyCopy(dst io.Writer, src io.Reader) error {
-	bufp := copyBufferPool.Get().(*[]byte)
-	defer copyBufferPool.Put(bufp)
-
-	_, err := io.CopyBuffer(dst, src, *bufp)
-	if err == nil {
-		return nil
-	}
-	if errors.Is(err, net.ErrClosed) || errors.Is(err, io.EOF) {
-		return nil
-	}
-	var opErr *net.OpError
-	if errors.As(err, &opErr) && opErr.Err != nil && strings.Contains(opErr.Err.Error(), "use of closed network connection") {
-		return nil
-	}
+func migrate(db *sql.DB) error {
+	_, err := db.Exec(`
+CREATE TABLE IF NOT EXISTS items (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+`)
 	return err
 }
 
-// firstRelevantCopyErr iterates through a list of errors and returns the first non-nil error.
-// It is used to capture and report the primary reason a connection failed during bi-directional copying.
-func firstRelevantCopyErr(errs ...error) error {
-	for _, err := range errs {
+func (s *server) healthz(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), time.Second)
+	defer cancel()
+	if err := s.db.PingContext(ctx); err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, apiError{Error: err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *server) listItems(w http.ResponseWriter, r *http.Request) {
+	rows, err := s.db.QueryContext(r.Context(), `SELECT key, value, created_at, updated_at FROM items ORDER BY key`)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, apiError{Error: err.Error()})
+		return
+	}
+	defer rows.Close()
+
+	items := make([]item, 0)
+	for rows.Next() {
+		it, err := scanItem(rows)
 		if err != nil {
-			return err
+			writeJSON(w, http.StatusInternalServerError, apiError{Error: err.Error()})
+			return
 		}
+		items = append(items, it)
+	}
+	if err := rows.Err(); err != nil {
+		writeJSON(w, http.StatusInternalServerError, apiError{Error: err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, items)
+}
+
+func (s *server) createItem(w http.ResponseWriter, r *http.Request) {
+	var input itemInput
+	if err := decodeJSON(r, &input); err != nil {
+		writeJSON(w, http.StatusBadRequest, apiError{Error: err.Error()})
+		return
+	}
+	input.Key = strings.TrimSpace(input.Key)
+	if input.Key == "" {
+		writeJSON(w, http.StatusBadRequest, apiError{Error: "key is required"})
+		return
+	}
+
+	it, err := s.upsert(r.Context(), input.Key, input.Value)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, apiError{Error: err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusCreated, it)
+}
+
+func (s *server) getItem(w http.ResponseWriter, r *http.Request) {
+	key, ok := itemKeyFromPath(r.URL.Path)
+	if !ok {
+		writeJSON(w, http.StatusBadRequest, apiError{Error: "item key is required"})
+		return
+	}
+
+	it, err := s.find(r.Context(), key)
+	if errors.Is(err, sql.ErrNoRows) {
+		writeJSON(w, http.StatusNotFound, apiError{Error: "item not found"})
+		return
+	}
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, apiError{Error: err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, it)
+}
+
+func (s *server) putItem(w http.ResponseWriter, r *http.Request) {
+	key, ok := itemKeyFromPath(r.URL.Path)
+	if !ok {
+		writeJSON(w, http.StatusBadRequest, apiError{Error: "item key is required"})
+		return
+	}
+
+	var input itemInput
+	if err := decodeJSON(r, &input); err != nil {
+		writeJSON(w, http.StatusBadRequest, apiError{Error: err.Error()})
+		return
+	}
+
+	it, err := s.upsert(r.Context(), key, input.Value)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, apiError{Error: err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, it)
+}
+
+func (s *server) deleteItem(w http.ResponseWriter, r *http.Request) {
+	key, ok := itemKeyFromPath(r.URL.Path)
+	if !ok {
+		writeJSON(w, http.StatusBadRequest, apiError{Error: "item key is required"})
+		return
+	}
+
+	result, err := s.db.ExecContext(r.Context(), `DELETE FROM items WHERE key = ?`, key)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, apiError{Error: err.Error()})
+		return
+	}
+	deleted, err := result.RowsAffected()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, apiError{Error: err.Error()})
+		return
+	}
+	if deleted == 0 {
+		writeJSON(w, http.StatusNotFound, apiError{Error: "item not found"})
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *server) upsert(ctx context.Context, key, value string) (item, error) {
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO items (key, value)
+VALUES (?, ?)
+ON CONFLICT(key) DO UPDATE SET
+    value = excluded.value,
+    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+`, key, value)
+	if err != nil {
+		return item{}, err
+	}
+	return s.find(ctx, key)
+}
+
+func (s *server) find(ctx context.Context, key string) (item, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT key, value, created_at, updated_at FROM items WHERE key = ?`, key)
+	return scanItem(row)
+}
+
+type itemScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanItem(scanner itemScanner) (item, error) {
+	var it item
+	var createdAt string
+	var updatedAt string
+	if err := scanner.Scan(&it.Key, &it.Value, &createdAt, &updatedAt); err != nil {
+		return item{}, err
+	}
+
+	created, err := time.Parse(time.RFC3339Nano, createdAt)
+	if err != nil {
+		return item{}, fmt.Errorf("parse created_at: %w", err)
+	}
+	updated, err := time.Parse(time.RFC3339Nano, updatedAt)
+	if err != nil {
+		return item{}, fmt.Errorf("parse updated_at: %w", err)
+	}
+	it.CreatedAt = created
+	it.UpdatedAt = updated
+	return it, nil
+}
+
+func itemKeyFromPath(path string) (string, bool) {
+	key := strings.TrimPrefix(path, "/items/")
+	key = strings.TrimSpace(key)
+	return key, key != "" && !strings.Contains(key, "/")
+}
+
+func decodeJSON(r *http.Request, dst any) error {
+	decoder := json.NewDecoder(io.LimitReader(r.Body, 1<<20))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(dst); err != nil {
+		return fmt.Errorf("invalid json: %w", err)
 	}
 	return nil
 }
 
-// tuneTCPConn applies specific TCP socket options like NoDelay (Nagle's algorithm) and KeepAlive settings.
-// We use this to optimize the network connections for latency and to detect dead connections over time.
-func tuneTCPConn(conn net.Conn, keepAlive time.Duration, disableKeepAlive bool) error {
-	tcp, ok := conn.(*net.TCPConn)
-	if !ok {
-		return nil
+func writeJSON(w http.ResponseWriter, status int, payload any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	if payload != nil {
+		_ = json.NewEncoder(w).Encode(payload)
 	}
-	if err := tcp.SetNoDelay(true); err != nil {
-		return err
-	}
-	if disableKeepAlive {
-		return tcp.SetKeepAlive(false)
-	}
-	if err := tcp.SetKeepAlive(true); err != nil {
-		return err
-	}
-	return tcp.SetKeepAlivePeriod(keepAlive)
 }
 
-// main is the entry point of the unikernel-proxy application.
-// It parses command-line flags, initializes the backend pool and proxy instance, and handles OS signals for graceful termination.
-func main() {
-	var (
-		listenAddr       = flag.String("listen", defaultListenAddr, "listen address")
-		backends         = flag.String("backends", "", "comma-separated backend addresses")
-		dialTimeout      = flag.Duration("dial-timeout", defaultDialTimeout, "backend dial timeout")
-		shutdownGrace    = flag.Duration("shutdown-grace", defaultShutdownGrace, "grace period before force-closing active connections")
-		tcpKeepAlive     = flag.Duration("tcp-keepalive", 30*time.Second, "TCP keepalive period")
-		disableKeepAlive = flag.Bool("disable-keepalive", false, "disable TCP keepalive")
-	)
-	flag.Parse()
-
-	logger := log.New(os.Stdout, "unikernel-proxy ", log.Ldate|log.Ltime|log.Lmicroseconds|log.LUTC)
-
-	pool, err := newBackendPool(*backends)
-	if err != nil {
-		logger.Fatalf("invalid backends: %v", err)
-	}
-
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer cancel()
-
-	p := newProxy(
-		*listenAddr,
-		*dialTimeout,
-		*shutdownGrace,
-		*tcpKeepAlive,
-		*disableKeepAlive,
-		pool,
-		logger,
-	)
-
-	if err := p.run(ctx); err != nil {
-		logger.Fatalf("proxy failed: %v", err)
-	}
+func requestLogger(logger *log.Logger, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		started := time.Now()
+		next.ServeHTTP(w, r)
+		logger.Printf("%s %s %s", r.Method, r.URL.Path, time.Since(started).Round(time.Microsecond))
+	})
 }

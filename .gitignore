@@ -1,0 +1,8 @@
+/build/*
+!/build/.gitkeep
+/.gocache/
+/app.db
+/app.db-*
+/rootfs/sqlite-api
+/rootfs/data/*.db
+/rootfs/data/*.db-*
