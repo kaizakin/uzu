@@ -12,18 +12,17 @@ rootfs:
   type: initrd
   include:
     - rootfs/etc:/etc
-    - build/proxy:/proxy
+    - rootfs/data:/data
+    - build/sqlite-api:/sqlite-api
 
 kernel:
   from: local
+  # initrd-enabled Unikraft elfloader binary
   path: build/elfloader_qemu-x86_64
 
 cmdline: >-
-  netdev.ip=172.44.0.2/24:172.44.0.1:172.44.0.1::tcp-proxy:local
+  netdev.ip=172.44.0.2/24:172.44.0.1:172.44.0.1::sqlite-api:local
   --
-  /proxy
+  /sqlite-api
   -listen=:8080
-  -backends=172.44.0.10:9001,172.44.0.11:9001,172.44.0.12:9001
-  -dial-timeout=3s
-  -shutdown-grace=10s
-  -tcp-keepalive=30s
+  -db=/data/app.db
