@@ -13,6 +13,10 @@ rootfs:
   include:
     - rootfs/etc:/etc
     - rootfs/data:/data
+    - rootfs/dev:/dev
+    - rootfs/proc:/proc
+    - rootfs/sys:/sys
+    - rootfs/tmp:/tmp
     - build/sqlite-api:/sqlite-api
 
 kernel:

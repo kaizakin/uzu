@@ -6,3 +6,7 @@
 /rootfs/sqlite-api
 /rootfs/data/*.db
 /rootfs/data/*.db-*
+/rootfs/dev/*
+!/rootfs/dev/.gitkeep
+/rootfs/tmp/*
+!/rootfs/tmp/.gitkeep
