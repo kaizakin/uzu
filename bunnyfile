@@ -21,8 +21,7 @@ rootfs:
 
 kernel:
   from: local
-  # initrd-enabled Unikraft elfloader binary
-  path: build/elfloader_qemu-x86_64
+  path: ./vmlinux
 
 cmdline: >-
   netdev.ip=172.44.0.2/24:172.44.0.1:172.44.0.1::sqlite-api:local
