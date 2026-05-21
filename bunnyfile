@@ -8,16 +8,16 @@ platforms:
   architecture: x86
 
 rootfs:
-  from: scratch
-  type: initrd
-  include:
-    - rootfs/etc:/etc
-    - rootfs/data:/data
-    - rootfs/dev:/dev
-    - rootfs/proc:/proc
-    - rootfs/sys:/sys
-    - rootfs/tmp:/tmp
-    - build/sqlite-api:/sqlite-api
+  from: local
+  path: build/initramfs-x86_64.cpio
+#  include:
+#    - rootfs/etc:/etc
+#    - rootfs/data:/data
+#    - rootfs/dev:/dev
+#    - rootfs/proc:/proc
+#    - rootfs/sys:/sys
+#    - rootfs/tmp:/tmp
+#    - build/sqlite-api:/sqlite-api
 
 kernel:
   from: local

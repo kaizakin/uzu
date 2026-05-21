@@ -1,5 +1,3 @@
-/build/*
-!/build/.gitkeep
 /.gocache/
 /app.db
 /app.db-*
