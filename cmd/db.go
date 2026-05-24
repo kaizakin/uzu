@@ -18,6 +18,8 @@ func openDatabase(path string) (*sql.DB, error) {
 		return nil, fmt.Errorf("create database directory: %w", err)
 	}
 
+	// Data source name
+	// 5000 ms timout
 	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(DELETE)&_pragma=foreign_keys(ON)", path)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
