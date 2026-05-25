@@ -8,3 +8,5 @@
 !/rootfs/dev/.gitkeep
 /rootfs/tmp/*
 !/rootfs/tmp/.gitkeep
+.config*
+.unikraft/*

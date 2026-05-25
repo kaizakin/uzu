@@ -8,24 +8,19 @@ platforms:
   architecture: x86
 
 rootfs:
-  from: local
-  path: build/initramfs-x86_64.cpio
-#  include:
-#    - rootfs/etc:/etc
-#    - rootfs/data:/data
-#    - rootfs/dev:/dev
-#    - rootfs/proc:/proc
-#    - rootfs/sys:/sys
-#    - rootfs/tmp:/tmp
-#    - build/sqlite-api:/sqlite-api
+  from: scratch
+  type: initrd
+  include:
+    - rootfs/etc:/etc
+    - rootfs/data:/data
+    - rootfs/dev:/dev
+    - rootfs/proc:/proc
+    - rootfs/sys:/sys
+    - rootfs/tmp:/tmp
+    - build/sqlite-api:/sqlite-api
 
 kernel:
   from: local
   path: ./vmlinux
 
-cmdline: >-
-  netdev.ip=172.44.0.2/24:172.44.0.1:172.44.0.1::sqlite-api:local
-  --
-  /sqlite-api
-  -listen=:8080
-  -db=/data/app.db
+cmd: ["/sqlite-api", "-listen=:8080", "-db=/data/app.db"]
