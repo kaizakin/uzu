@@ -1,0 +1,19 @@
+spec: v0.6
+name: sqlite-api
+
+unikraft:
+  version: 0.17.0
+
+
+template: https://github.com/unikraft/app-elfloader.git
+rootfs: ./Dockerfile.rootfs
+
+cmd:
+  - /sqlite-api
+  - -listen=:8080
+  - -db=/data/app.db
+
+targets:
+  - name: qemu-x86_64
+    architecture: x86_64
+    platform: qemu
